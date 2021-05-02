@@ -1,17 +1,6 @@
-OBS Studio <https://obsproject.com>
-===================================
+OBS Studio
 
-.. image:: https://dev.azure.com/obsjim/obsjim/_apis/build/status/obsproject.obs-studio?branchName=master
-   :alt: OBS Studio Build Status - Azure Pipelines
-   :target: https://dev.azure.com/obsjim/obsjim/_build/latest?definitionId=1&branchName=master
-
-.. image:: https://d322cqt584bo4o.cloudfront.net/obs-studio/localized.svg
-   :alt: OBS Studio Translation Project Progress
-   :target: https://crowdin.com/project/obs-studio
-
-.. image:: https://discordapp.com/api/guilds/348973006581923840/widget.png?style=shield
-   :alt: OBS Studio Discord Server
-   :target: https://obsproject.com/discord
+the project set the SEI
 
 What is OBS Studio?
 -------------------
