@@ -17,10 +17,232 @@
 
 #include "obs.h"
 #include "obs-internal.h"
+#include "listlib.h"
 
 #define encoder_active(encoder) os_atomic_load_bool(&encoder->active)
 #define set_encoder_active(encoder, val) \
 	os_atomic_set_bool(&encoder->active, val)
+
+#define UUID_SIZE 16
+
+//static unsigned char uuid[] = {0xdc, 0x45, 0xe9, 0xbd, 0xe6, 0xd9, 0x48, 0xb7,0x96, 0x2c, 0xd8, 0x20, 0xd9, 0x23, 0xee, 0xef};
+//self UUID
+static unsigned char uuid[] = {0x54, 0x80, 0x83, 0x97, 0xf0, 0x23, 0x47, 0x4b,0xb7, 0xf7, 0x4f, 0x32, 0xb5, 0x4e, 0x06, 0xac};
+
+//static unsigned char uuid[] = {0x93, 0xbb, 0xde,0xfc, 0x45, 0xe4, 0x46, 0xee, 0xa4, 0xde, 0xcd, 0x7c, 0xd0, 0xdb, 0x3e, 0xad, 0x02};
+
+//开始码
+static unsigned char start_code[] = {0x00, 0x00, 0x00, 0x01};
+
+static const int max_sei_info_count = 10;
+static int cur_sei_count = 0;
+#define MAX_SEI_INFO_COUNT max_sei_info_count
+#define MAX_SEI_INFO_SIZE 255
+pthread_mutex_t sei_buffer_mutex;
+pthread_mutexattr_t attr;
+
+
+//static queue_data* sei_info_list;
+struct queue_data {
+	struct list_head node; // 双链表节点，用于入列出列
+	uint8_t data[MAX_SEI_INFO_SIZE]; // 这个是队列数据示例，具体可能是其他类型的数据
+} sei_info_list;
+
+static struct list_head queue_head = LIST_HEAD_INIT(queue_head);
+static struct list_head queue_pre_head = LIST_HEAD_INIT(queue_pre_head);
+
+uint32_t reversebytes(uint32_t value)
+{
+	return (value & 0x000000FFU) << 24 | (value & 0x0000FF00U) << 8 |
+	       (value & 0x00FF0000U) >> 8 | (value & 0xFF000000U) >> 24;
+}
+
+uint32_t get_sei_nalu_size(uint32_t content)
+{
+	//SEI payload size
+	uint32_t sei_payload_size = content + UUID_SIZE;
+	//NALU + payload类型 + 数据长度 + 数据
+	uint32_t sei_size = 1 + 1 +
+			    (sei_payload_size / 0xFF +
+			     (sei_payload_size % 0xFF != 0 ? 1 : 0)) +
+			    sei_payload_size;
+	// stop code
+	uint32_t tail_size = 2;
+	if (sei_size % 2 == 1) {
+		tail_size -= 1;
+	}
+	sei_size += tail_size;
+
+	return sei_size;
+}
+
+uint32_t get_sei_packet_size(uint32_t size)
+{
+	return get_sei_nalu_size(size) + 4;
+}
+
+int fill_sei_packet(unsigned char *packet, bool isAnnexb, const char *content,
+		    uint32_t size)
+{
+	unsigned char *data = (unsigned char *)packet;
+	unsigned int nalu_size = (unsigned int)get_sei_nalu_size(size);
+	uint32_t sei_size = nalu_size;
+	//大端转小端
+	nalu_size = reversebytes(nalu_size);
+
+	//NALU开始码
+	unsigned int *size_ptr = &nalu_size;
+	if (isAnnexb) {
+		memcpy(data, start_code, sizeof(unsigned int));
+	} else {
+		memcpy(data, size_ptr, sizeof(unsigned int));
+	}
+	data += sizeof(unsigned int);
+
+	unsigned char *sei = data;
+	//NAL header
+	*data++ = 6; //SEI
+	//sei payload type
+	*data++ = 5; //unregister
+	size_t sei_payload_size = size + UUID_SIZE;
+	//数据长度
+	while (true) {
+		*data++ = (sei_payload_size >= 0xFF ? 0xFF
+						    : (char)sei_payload_size);
+		if (sei_payload_size < 0xFF)
+			break;
+		sei_payload_size -= 0xFF;
+	}
+
+	//UUID
+	memcpy(data, uuid, UUID_SIZE);
+	data += UUID_SIZE;
+	//数据
+	memcpy(data, content, size);
+	data += size;
+
+	//tail stop code
+	if (sei + sei_size - data == 1) {
+		*data = 0x80;
+	} else if (sei + sei_size - data == 2) {
+		*data++ = 0x00;
+		*data++ = 0x80;
+	}
+
+	return true;
+}
+
+int get_sei_buffer(unsigned char *data, uint32_t size, char *buffer, int *count)
+{
+	unsigned char *sei = data;
+	int sei_type = 0;
+	unsigned sei_size = 0;
+	//payload type
+	do {
+		sei_type += *sei;
+	} while (*sei++ == 255);
+	//数据长度
+	do {
+		sei_size += *sei;
+	} while (*sei++ == 255);
+
+	//检查UUID
+	if (sei_size >= UUID_SIZE && sei_size <= (data + size - sei) &&
+	    sei_type == 5 && memcmp(sei, uuid, UUID_SIZE) == 0) {
+		sei += UUID_SIZE;
+		sei_size -= UUID_SIZE;
+
+		if (buffer != NULL && count != NULL) {
+			if (*count > (int)sei_size) {
+				memcpy(buffer, sei, sei_size);
+			}
+		}
+		if (count != NULL) {
+			*count = sei_size;
+		}
+		return sei_size;
+	}
+	return -1;
+}
+
+int get_sei_content(unsigned char *packet, uint32_t size, char *buffer,
+		    int *count)
+{
+	unsigned char ANNEXB_CODE_LOW[] = {0x00, 0x00, 0x00, 0x01};
+	unsigned char ANNEXB_CODE[] = {0x00, 0x00, 0x00, 0x01};
+
+	unsigned char *data = packet;
+	bool isAnnexb = false;
+	if ((size > 3 && memcmp(data, ANNEXB_CODE_LOW, 3) == 0) ||
+	    (size > 4 && memcmp(data, ANNEXB_CODE, 4) == 0)) {
+		isAnnexb = true;
+	}
+	//暂时只处理MP4封装,annexb暂为处理
+	if (isAnnexb) {
+		while (data < packet + size) {
+			if ((packet + size - data) > 4 && data[0] == 0x00 &&
+			    data[1] == 0x00) {
+				int startCodeSize = 2;
+				if (data[2] == 0x01) {
+					startCodeSize = 3;
+				} else if (data[2] == 0x00 && data[3] == 0x01) {
+					startCodeSize = 4;
+				}
+				if (startCodeSize == 3 || startCodeSize == 4) {
+					if ((packet + size - data) >
+						    (startCodeSize + 1) &&
+					    (data[startCodeSize] & 0x1F) == 6) {
+						//SEI
+						unsigned char *sei =
+							data + startCodeSize +
+							1;
+
+						int ret = get_sei_buffer(
+							sei,
+							(packet + size - sei),
+							buffer, count);
+						if (ret != -1) {
+							return ret;
+						}
+					}
+					data += startCodeSize + 1;
+				} else {
+					data += startCodeSize + 1;
+				}
+			} else {
+				data++;
+			}
+		}
+	} else {
+		//当前NALU
+		while (data < packet + size) {
+			//MP4格式起始码/长度
+			unsigned int *length = (unsigned int *)data;
+			int nalu_size = (int)reversebytes(*length);
+			//NALU header
+			if ((*(data + 4) & 0x1F) == 6) {
+				//SEI
+				unsigned char *sei = data + 4 + 1;
+
+				int ret = get_sei_buffer(
+					sei,
+					min(nalu_size, (packet + size - sei)),
+					buffer, count);
+				if (ret != -1) {
+					return ret;
+				}
+			}
+			data += 4 + nalu_size;
+		}
+	}
+	return -1;
+}
+
+void queue_clear(struct list_head targetHead);
+
+int queue_in(struct queue_data* newdata, struct list_head* targetHead);
+
+struct queue_data* queue_out(struct list_head *targetHead);
 
 struct obs_encoder_info *find_encoder(const char *id)
 {
@@ -126,8 +348,17 @@ obs_encoder_t *obs_video_encoder_create(const char *id, const char *name,
 {
 	if (!name || !id)
 		return NULL;
-	return create_encoder(id, OBS_ENCODER_VIDEO, name, settings, 0,
-			      hotkey_data);
+	struct obs_encoder* creat_item = create_encoder(id, OBS_ENCODER_VIDEO, name, settings, 0,
+		hotkey_data);
+	if (creat_item != NULL)
+	{
+		INIT_LIST_HEAD(&queue_head);
+		INIT_LIST_HEAD(&queue_pre_head);
+		pthread_mutex_init(&sei_buffer_mutex, &attr);
+	}
+	return creat_item;
+	/*return create_encoder(id, OBS_ENCODER_VIDEO, name, settings, 0,
+				  hotkey_data);*/
 }
 
 obs_encoder_t *obs_audio_encoder_create(const char *id, const char *name,
@@ -252,7 +483,10 @@ static inline void free_audio_buffers(struct obs_encoder *encoder)
 
 static void obs_encoder_actually_destroy(obs_encoder_t *encoder)
 {
-	if (encoder) {
+	if (encoder) {		
+		queue_clear(queue_head);
+		queue_clear(queue_pre_head);
+
 		pthread_mutex_lock(&encoder->outputs_mutex);
 		for (size_t i = 0; i < encoder->outputs.num; i++) {
 			struct obs_output *output = encoder->outputs.array[i];
@@ -881,15 +1115,174 @@ static void send_first_video_packet(struct obs_encoder *encoder,
 	da_free(data);
 }
 
+static void send_sei_video_packet(struct obs_encoder *encoder,
+				  struct encoder_callback *cb,
+				  struct encoder_packet *packet,
+				  uint8_t* sei_info)
+{
+	struct encoder_packet targetPacket;
+	DARRAY(uint8_t) data;
+	
+	/* always wait for first keyframe */
+	/*if (!packet->keyframe) {
+		cb->new_packet(cb->param, packet);
+		return;
+	}*/
+
+	da_init(data);
+
+	/*if (!get_sei(encoder, &sei, &size) || !sei || !size) {
+		cb->new_packet(cb->param, packet);
+		cb->sent_first_packet = true;
+		return;
+	}*/
+
+	uint32_t contineSize;
+	uint8_t *contine = sei_info;
+	uint32_t inputSize = strlen(contine);
+	contineSize = get_sei_packet_size(inputSize);
+	uint8_t *sei = (uint8_t *)malloc(contineSize * sizeof(uint8_t));
+	fill_sei_packet(sei, true, contine, inputSize);
+
+	da_push_back_array(data, sei, contineSize);
+	da_push_back_array(data, packet->data, packet->size);
+
+	targetPacket = *packet;
+	targetPacket.data = data.array;
+	targetPacket.size = data.num;
+	cb->new_packet(cb->param, &targetPacket);
+	//cb->sent_first_packet = true;
+
+	//free(sei);
+	da_free(data);
+}
+
+void queue_clear(struct list_head targetHead)
+{
+	struct queue_data* data;
+	struct list_head* node;
+
+	while (list_empty(&targetHead))
+	{
+		//否则有数据，取出第一个点数据
+		node = targetHead.next;
+
+		// 已知链表节点 node ，可以反推算出 struct queue_data 的地址
+		data = container_of(node, struct queue_data, node);
+
+		// 从 queue_head 中删除当前节点，即当前节点已出列
+		list_del(node);
+		bfree(data);
+	}
+	cur_sei_count = 0;
+}
+
+int queue_in(struct queue_data* newdata, struct list_head* targetHead)
+{
+	// 把 newdata 的 node 链表节点接入到 queue_head 的尾部
+	list_add_tail(&newdata->node, targetHead);
+	return 0;
+}
+
+struct queue_data* queue_out(struct list_head *targetHead)
+{
+	struct queue_data* data;
+	struct list_head* node;
+
+	// 如果链表为空，即没有数据
+	if (list_empty(targetHead)) {
+		return NULL;
+	}
+
+	//否则有数据，取出第一个点数据
+	node = targetHead->next;
+
+	// 已知链表节点 node ，可以反推算出 struct queue_data 的地址
+	data = container_of(node, struct queue_data, node);
+
+	// 从 queue_head 中删除当前节点，即当前节点已出列
+	list_del(node);
+
+	return data;
+}
+
 static inline void send_packet(struct obs_encoder *encoder,
 			       struct encoder_callback *cb,
 			       struct encoder_packet *packet)
 {
 	/* include SEI in first video packet */
-	if (encoder->info.type == OBS_ENCODER_VIDEO && !cb->sent_first_packet)
+	if (encoder->info.type == OBS_ENCODER_VIDEO && !cb->sent_first_packet) {
 		send_first_video_packet(encoder, cb, packet);
-	else
+	} 
+	else 
+	{			
+		if (encoder->info.type == OBS_ENCODER_VIDEO)
+		{			
+			uint8_t get_data[MAX_SEI_INFO_SIZE];			
+			memset(get_data, 0, MAX_SEI_INFO_SIZE);
+			pthread_mutex_lock(&sei_buffer_mutex);
+			struct queue_data* get_item = NULL;
+			get_item = queue_out(&queue_head);
+			if (get_item != NULL && cur_sei_count > 0)
+			{				
+				cur_sei_count--;
+				size_t data_size = strlen(get_item->data);
+				//get_data = (uint8_t*)malloc(data_size * sizeof(uint8_t));				
+				memcpy(get_data, get_item->data, data_size);
+				//get_data = get_item->data;
+				queue_in(get_item, &queue_pre_head);
+			}				
+			pthread_mutex_unlock(&sei_buffer_mutex);
+
+			if (strlen(get_data) != 0)
+			{
+				send_sei_video_packet(encoder, cb, packet, get_data);					
+			}
+			else
+			{
+				cb->new_packet(cb->param, packet);
+			}				
+		} else {
+			cb->new_packet(cb->param, packet);			
+		}
+	}
+
+	/*if (encoder->info.type == OBS_ENCODER_VIDEO && !cb->sent_first_packet) {
+		send_first_video_packet(encoder, cb, packet);
+	} else {
 		cb->new_packet(cb->param, packet);
+	}*/
+}
+
+int obs_encoder_set_sei_video(uint8_t* sei_info, const size_t sei_info_size)
+{
+	pthread_mutex_lock(&sei_buffer_mutex);
+	if (cur_sei_count < MAX_SEI_INFO_COUNT && cur_sei_count >= 0)
+	{
+		printf("LOCK--------------LOCK-------------send SEI");
+		struct queue_data* get_item = queue_out(&queue_pre_head);
+		if (get_item == NULL)
+		{
+			get_item = (struct queue_data*)malloc(sizeof(struct queue_data));
+		}
+				
+		size_t data_size = strlen(sei_info);
+		if (data_size >= MAX_SEI_INFO_SIZE)
+		{
+			return -2;
+		}
+		memset(get_item->data, 0, MAX_SEI_INFO_SIZE);
+		memcpy(get_item->data, sei_info, data_size);
+		queue_in(get_item, &queue_head);
+		cur_sei_count++;
+		pthread_mutex_unlock(&sei_buffer_mutex);
+		return 0;
+	}
+	else
+	{
+		pthread_mutex_unlock(&sei_buffer_mutex);
+		return -1;
+	}		
 }
 
 void full_stop(struct obs_encoder *encoder)
