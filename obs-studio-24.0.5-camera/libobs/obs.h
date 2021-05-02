@@ -2042,6 +2042,9 @@ EXPORT void obs_encoder_set_video(obs_encoder_t *encoder, video_t *video);
 /** Sets the audio output context to be used with this encoder */
 EXPORT void obs_encoder_set_audio(obs_encoder_t *encoder, audio_t *audio);
 
+/** Set sei info to video */
+EXPORT int obs_encoder_set_sei_video(uint8_t* sei_info, const size_t sei_info_size);
+
 /**
  * Returns the video output context used with this encoder, or NULL if not
  * a video context
