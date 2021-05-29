@@ -1,6 +1,6 @@
 OBS Studio
 
-the project set the SEI
+the project is about to set the SEI during H.264 encode
 
 What is OBS Studio?
 -------------------
